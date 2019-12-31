@@ -80,9 +80,15 @@ uploader \
 {{- end }}
 
 {{- if .Values.s3 }}
-uploader \
-  --cloud=aws \
-  --region={{ .Values.s3.region }} \
-  --bucket={{ .Values.s3.bucket }} \
-  --backup-dir=${dirname}
+bucket={{ .Values.s3.bucket }}
+cat <<EOF > /tmp/rclone.conf
+[aws]
+type = s3
+provider = AWS
+env_auth = true
+region = us-west-2
+EOF
+cd "${backup_base_dir}"
+tar -cf - "${backup_name}" | pigz -p 16 \
+  | rclone --config /tmp/rclone.conf rcat aws:${bucket}/${backup_name}/${backup_name}.tgz
 {{- end }}
