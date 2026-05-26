@@ -1,4 +1,4 @@
-// Copyright 2021 PingCAP, Inc.
+// Copyright 2024 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -17,9 +18,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/pingcap/tidb-operator/pkg/apis/pingcap/v1alpha1"
-	"github.com/pingcap/tidb-operator/tests/e2e/br/utils/portforward"
-	"k8s.io/client-go/kubernetes"
+	"github.com/pingcap/tidb-operator/api/v2/br/v1alpha1"
+	"github.com/pingcap/tidb-operator/v2/pkg/client"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/k8s"
 )
 
 type Interface interface {
@@ -31,7 +32,7 @@ type Interface interface {
 	Bucket() string
 }
 
-func New(provider string, c kubernetes.Interface, fw portforward.PortForwarder) (Interface, error) {
+func New(provider string, c client.Client, fw k8s.PortForwarder) (Interface, error) {
 	switch provider {
 	case "kind":
 		return NewMinio(c, fw), nil

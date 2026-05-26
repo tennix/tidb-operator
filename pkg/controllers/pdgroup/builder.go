@@ -1,0 +1,72 @@
+// Copyright 2024 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pdgroup
+
+import (
+	"github.com/pingcap/tidb-operator/v2/pkg/controllers/common"
+	"github.com/pingcap/tidb-operator/v2/pkg/controllers/pdgroup/tasks"
+	"github.com/pingcap/tidb-operator/v2/pkg/runtime"
+	"github.com/pingcap/tidb-operator/v2/pkg/runtime/scope"
+	"github.com/pingcap/tidb-operator/v2/pkg/utils/task/v3"
+)
+
+func (r *Reconciler) NewRunner(state *tasks.ReconcileContext, reporter task.TaskReporter) task.TaskRunner {
+	runner := task.NewTaskRunner(reporter,
+		// get pdgroup
+		common.TaskContextObject[scope.PDGroup](state, r.Client),
+		// if it's gone just return
+		task.IfBreak(common.CondObjectHasBeenDeleted[scope.PDGroup](state)),
+
+		// get cluster
+		common.TaskContextCluster[scope.PDGroup](state, r.Client),
+		// if it's paused just return
+		task.IfBreak(common.CondClusterIsPaused(state)),
+		task.IfBreak(common.CondFeatureGatesIsNotSynced[scope.PDGroup](state)),
+
+		// get all pds
+		common.TaskContextSlice[scope.PDGroup](state, r.Client),
+
+		task.IfBreak(common.CondObjectIsDeleting[scope.PDGroup](state),
+			tasks.TaskFinalizerDel(state, r.Client),
+			common.TaskGroupConditionReady[scope.PDGroup](state),
+			common.TaskGroupConditionSynced[scope.PDGroup](state),
+			common.TaskStatusRevisionAndReplicas[scope.PDGroup](state),
+			common.TaskStatusPersister[scope.PDGroup](state, r.Client),
+		),
+		common.TaskFinalizerAdd[scope.PDGroup](state, r.Client),
+
+		common.TaskRevision[runtime.PDGroupTuple](state, r.Client),
+
+		task.IfBreak(
+			common.CondClusterIsSuspending(state),
+			common.TaskGroupConditionSuspended[scope.PDGroup](state),
+			common.TaskGroupConditionReady[scope.PDGroup](state),
+			common.TaskGroupConditionSynced[scope.PDGroup](state),
+			common.TaskStatusPersister[scope.PDGroup](state, r.Client),
+		),
+		tasks.TaskContextPDClient(state, r.PDClientManager),
+		tasks.TaskBoot(state, r.Client),
+		tasks.TaskService(state, r.Client),
+		tasks.TaskUpdater(state, r.Client, r.AllocateFactory),
+		common.TaskGroupStatusSelector[scope.PDGroup](state),
+		common.TaskGroupConditionSuspended[scope.PDGroup](state),
+		common.TaskGroupConditionReady[scope.PDGroup](state),
+		common.TaskGroupConditionSynced[scope.PDGroup](state),
+		common.TaskStatusRevisionAndReplicas[scope.PDGroup](state),
+		common.TaskStatusPersister[scope.PDGroup](state, r.Client),
+	)
+
+	return runner
+}

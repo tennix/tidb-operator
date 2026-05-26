@@ -1,0 +1,76 @@
+// Copyright 2024 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tasks
+
+import (
+	"cmp"
+	"context"
+	"slices"
+
+	"k8s.io/apimachinery/pkg/labels"
+
+	"github.com/pingcap/tidb-operator/v2/pkg/timanager"
+	pdm "github.com/pingcap/tidb-operator/v2/pkg/timanager/pd"
+	"github.com/pingcap/tidb-operator/v2/pkg/utils/task/v3"
+)
+
+type ReconcileContext struct {
+	State
+
+	Members []Member
+
+	// mark pdgroup is bootstrapped if cache of pd is synced
+	IsBootstrapped bool
+}
+
+// Member is a member of the PD.
+// TODO: move to pdapi
+type Member struct {
+	ID   string
+	Name string
+}
+
+func TaskContextPDClient(state *ReconcileContext, m pdm.PDClientManager) task.Task {
+	return task.NameTaskFunc("ContextPDClient", func(_ context.Context) task.Result {
+		ck := state.Cluster()
+		pc, ok := m.Get(timanager.PrimaryKey(ck.Namespace, ck.Name))
+		if !ok {
+			return task.Complete().With("context without pd client is completed, pd cannot be visited")
+		}
+
+		if !pc.HasSynced() {
+			return task.Complete().With("context without pd client is completed, cache of pd info is not synced")
+		}
+
+		state.IsBootstrapped = true
+
+		ms, err := pc.Members().List(labels.Everything())
+		if err != nil {
+			return task.Fail().With("cannot list members: %w", err)
+		}
+
+		for _, m := range ms {
+			state.Members = append(state.Members, Member{
+				Name: m.Name,
+				ID:   m.ID,
+			})
+		}
+		slices.SortFunc(state.Members, func(a, b Member) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
+
+		return task.Complete().With("context is fully completed")
+	})
+}

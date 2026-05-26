@@ -1,4 +1,4 @@
-// Copyright 2019 PingCAP, Inc.
+// Copyright 2024 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,543 +8,417 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package tidbcluster
+package tikv
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	_ "net/http/pprof"
-	"reflect"
 	"time"
 
-	"github.com/onsi/ginkgo"
-	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/wait"
-	clientset "k8s.io/client-go/kubernetes"
-	typedappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
-	restclient "k8s.io/client-go/rest"
-	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
-	"k8s.io/utils/pointer"
-	ctrlCli "sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	astsHelper "github.com/pingcap/advanced-statefulset/client/apis/apps/v1/helper"
-	asclientset "github.com/pingcap/advanced-statefulset/client/client/clientset/versioned"
-	"github.com/pingcap/tidb-operator/pkg/apis/label"
-	"github.com/pingcap/tidb-operator/pkg/apis/pingcap/v1alpha1"
-	"github.com/pingcap/tidb-operator/pkg/client/clientset/versioned"
-	"github.com/pingcap/tidb-operator/pkg/controller"
-	"github.com/pingcap/tidb-operator/pkg/manager/member"
-	"github.com/pingcap/tidb-operator/pkg/scheme"
-	"github.com/pingcap/tidb-operator/tests"
-	e2econfig "github.com/pingcap/tidb-operator/tests/e2e/config"
-	e2eframework "github.com/pingcap/tidb-operator/tests/e2e/framework"
-	utilimage "github.com/pingcap/tidb-operator/tests/e2e/util/image"
-	"github.com/pingcap/tidb-operator/tests/e2e/util/portforward"
-	utiltc "github.com/pingcap/tidb-operator/tests/e2e/util/tidbcluster"
-	"github.com/pingcap/tidb-operator/tests/pkg/fixture"
-	framework "github.com/pingcap/tidb-operator/tests/third_party/k8s"
-	"github.com/pingcap/tidb-operator/tests/third_party/k8s/log"
+	"github.com/pingcap/tidb-operator/api/v2/core/v1alpha1"
+	"github.com/pingcap/tidb-operator/v2/pkg/apicall"
+	coreutil "github.com/pingcap/tidb-operator/v2/pkg/apiutil/core/v1alpha1"
+	"github.com/pingcap/tidb-operator/v2/pkg/runtime/scope"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/data"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/framework"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/label"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/cert"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/waiter"
 )
 
-type testcase struct {
-	idx                int
-	originTiKVReplica  int32
-	finalTiKVReplica   int32
-	scaleInParallelism int32
-	originDeleteSlots  sets.Int32
-	finalDeleteSlots   sets.Int32
-	scaleInOrdinals    []int32
+var _ = ginkgo.Describe("TiKV", label.TiKV, func() {
+	f := framework.New()
+	f.Setup()
 
-	deleteSlotsEvolutions [][]int32 // the changing process of delete slots
-	scaleInGroups         [][]int32 // the groups of ordinals that scaled in at the same time
-}
-
-var testCasesWithoutAsts = []testcase{
-	{
-		idx:                0,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 1,
-		scaleInGroups: [][]int32{
-			{4},
-			{3},
-		},
-	},
-	{
-		idx:                1,
-		originTiKVReplica:  6,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		scaleInGroups: [][]int32{
-			{5, 4},
-			{3},
-		},
-	},
-	{
-		idx:                2,
-		originTiKVReplica:  6,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 3,
-		scaleInGroups: [][]int32{
-			{5, 4, 3},
-		},
-	},
-}
-
-var testCasesWithAsts = []testcase{
-	{
-		idx:                0,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 1,
-		originDeleteSlots:  sets.NewInt32(),
-		finalDeleteSlots:   sets.NewInt32(1, 3),
-		scaleInOrdinals:    []int32{3, 1},
-		deleteSlotsEvolutions: [][]int32{
-			{3},
-			{1, 3},
-		},
-		scaleInGroups: [][]int32{
-			{3},
-			{1},
-		},
-	},
-	{
-		idx:                1,
-		originTiKVReplica:  6,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(),
-		finalDeleteSlots:   sets.NewInt32(1, 3, 5),
-		scaleInOrdinals:    []int32{5, 3, 1},
-		deleteSlotsEvolutions: [][]int32{
-			{3, 5},
-			{1, 3, 5},
-		},
-		scaleInGroups: [][]int32{
-			{3, 5},
-			{1},
-		},
-	},
-	{
-		idx:                2,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 1,
-		originDeleteSlots:  sets.NewInt32(1),
-		finalDeleteSlots:   sets.NewInt32(),
-		scaleInOrdinals:    []int32{5, 4, 3},
-		deleteSlotsEvolutions: [][]int32{
-			{1},
-		},
-		scaleInGroups: [][]int32{
-			{5},
-			{4},
-			{3},
-		},
-	},
-	{
-		idx:                3,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(1),
-		finalDeleteSlots:   sets.NewInt32(),
-		scaleInOrdinals:    []int32{5, 4, 3},
-		deleteSlotsEvolutions: [][]int32{
-			{1},
-		},
-		scaleInGroups: [][]int32{
-			{5, 4},
-			{3},
-		},
-	},
-	{
-		idx:                4,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 1,
-		originDeleteSlots:  sets.NewInt32(1),
-		finalDeleteSlots:   sets.NewInt32(2),
-		scaleInOrdinals:    []int32{5, 4, 2},
-		deleteSlotsEvolutions: [][]int32{
-			{1},
-			{2},
-		},
-		scaleInGroups: [][]int32{
-			{5},
-			{4},
-			{2},
-		},
-	},
-	{
-		idx:                5,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 3,
-		originDeleteSlots:  sets.NewInt32(1),
-		finalDeleteSlots:   sets.NewInt32(2),
-		scaleInOrdinals:    []int32{5, 4, 2},
-		deleteSlotsEvolutions: [][]int32{
-			{1},
-			{2},
-		},
-		scaleInGroups: [][]int32{
-			{5, 4, 2},
-		},
-	},
-	{
-		idx:                6,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(1, 2),
-		finalDeleteSlots:   sets.NewInt32(2, 3),
-		scaleInOrdinals:    []int32{6, 5, 3, 4},
-		deleteSlotsEvolutions: [][]int32{
-			{1, 2},
-			{2},
-			{2, 3},
-		},
-		scaleInGroups: [][]int32{
-			{6, 5},
-			{3},
-		},
-	},
-	{
-		idx:                7,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(1),
-		finalDeleteSlots:   sets.NewInt32(2, 6),
-		scaleInOrdinals:    []int32{5, 4, 2},
-		deleteSlotsEvolutions: [][]int32{
-			{1},
-			{6},
-			{2, 6},
-		},
-		scaleInGroups: [][]int32{
-			{5, 4},
-			{2},
-		},
-	},
-	{
-		idx:                8,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(1, 6),
-		finalDeleteSlots:   sets.NewInt32(2),
-		scaleInOrdinals:    []int32{5, 4, 2},
-		deleteSlotsEvolutions: [][]int32{
-			{1, 6},
-			{2},
-		},
-		scaleInGroups: [][]int32{
-			{5, 4},
-			{2},
-		},
-	},
-	{
-		idx:                9,
-		originTiKVReplica:  5,
-		finalTiKVReplica:   3,
-		scaleInParallelism: 2,
-		originDeleteSlots:  sets.NewInt32(1, 6),
-		finalDeleteSlots:   sets.NewInt32(2, 7),
-		scaleInOrdinals:    []int32{5, 4, 2},
-		deleteSlotsEvolutions: [][]int32{
-			{1, 6},
-			{7},
-			{2, 7},
-		},
-		scaleInGroups: [][]int32{
-			{5, 4},
-			{2},
-		},
-	},
-}
-
-func (t *testcase) description() string {
-	return fmt.Sprintf("[origin-%v-final-%v-parallelism-%v-testcase-idx-%v]", t.originTiKVReplica, t.finalTiKVReplica, t.scaleInParallelism, t.idx)
-}
-
-var _ = ginkgo.Describe("[TiKV: Scale in simultaneously]", func() {
-	f := e2eframework.NewDefaultFramework("tidb-cluster-with-asts")
-
-	var ns string
-	var c clientset.Interface
-	var cli versioned.Interface
-	var asCli asclientset.Interface
-	var aggrCli aggregatorclient.Interface
-	var apiExtCli apiextensionsclientset.Interface
-	var cfg *tests.Config
-	var config *restclient.Config
-	var fwCancel context.CancelFunc
-	var fw portforward.PortForward
-
-	ginkgo.BeforeEach(func() {
-		ns = f.Namespace.Name
-		c = f.ClientSet
-
-		var err error
-		config, err = framework.LoadConfig()
-		framework.ExpectNoError(err, "failed to load config")
-		cli, err = versioned.NewForConfig(config)
-		framework.ExpectNoError(err, "failed to create clientset for pingcap")
-		asCli, err = asclientset.NewForConfig(config)
-		framework.ExpectNoError(err, "failed to create clientset for advanced-statefulset")
-		aggrCli, err = aggregatorclient.NewForConfig(config)
-		framework.ExpectNoError(err, "failed to create clientset kube-aggregator")
-		apiExtCli, err = apiextensionsclientset.NewForConfig(config)
-		framework.ExpectNoError(err, "failed to create clientset apiextensions-apiserver")
-		clientRawConfig, err := e2econfig.LoadClientRawConfig()
-		framework.ExpectNoError(err, "failed to load raw config for tidb-operator")
-		ctx, cancel := context.WithCancel(context.Background())
-		fw, err = portforward.NewPortForwarder(ctx, e2econfig.NewSimpleRESTClientGetter(clientRawConfig))
-		framework.ExpectNoError(err, "failed to create port forwarder")
-		fwCancel = cancel
-		cfg = e2econfig.TestConfig
-	})
-
-	ginkgo.AfterEach(func() {
-		if fwCancel != nil {
-			fwCancel()
-		}
-	})
-
-	ginkgo.Context("[Scale in simultaneously without asts]", func() {
-		var ocfg *tests.OperatorConfig
-		var oa *tests.OperatorActions
-		var genericCli ctrlCli.Client
-		var err error
-
-		ginkgo.BeforeEach(func() {
-			ocfg = e2econfig.NewDefaultOperatorConfig(cfg)
-			oa = tests.NewOperatorActions(cli, c, asCli, aggrCli, apiExtCli, tests.DefaultPollInterval, ocfg, e2econfig.TestConfig, fw, f)
-			oa.CleanCRDOrDie()
-			oa.CreateCRDOrDie(ocfg)
-			ginkgo.By("Installing tidb-operator")
-			oa.CleanOperatorOrDie(ocfg)
-			oa.DeployOperatorOrDie(ocfg)
-			genericCli, err = ctrlCli.New(config, ctrlCli.Options{Scheme: scheme.Scheme})
-			framework.ExpectNoError(err, "failed to create clientset")
-		})
-
-		ginkgo.AfterEach(func() {
-			ginkgo.By("Uninstall tidb-operator")
-			oa.CleanOperatorOrDie(ocfg)
-			ginkgo.By("Uninstalling CRDs")
-			oa.CleanCRDOrDie()
-		})
-
-		for _, tcase := range testCasesWithoutAsts {
-			ginkgo.It(tcase.description(), func() {
-				ginkgo.By("Deploy initial tc")
-				tc := fixture.GetTidbCluster(ns, fmt.Sprintf("scale-in-simultaneously-without-asts-%v", tcase.idx), utilimage.TiDBLatest)
-				tc.Spec.PD.Replicas = 1
-				tc.Spec.TiDB.Replicas = 1
-				tc.Spec.TiKV.Replicas = tcase.originTiKVReplica
-				utiltc.MustCreateTCWithComponentsReady(genericCli, oa, tc, 10*time.Minute, 10*time.Second)
-
-				err := controller.GuaranteedUpdate(genericCli, tc, func() error {
-					tc.Spec.TiKV.ScalePolicy = v1alpha1.ScalePolicy{
-						ScaleInParallelism: pointer.Int32Ptr(tcase.scaleInParallelism),
-					}
-					tc.Spec.TiKV.Replicas = tcase.finalTiKVReplica
-					return nil
-				})
-				framework.ExpectNoError(err, "failed to scale in %s for TidbCluster /%s", ns, tc.Name)
-				log.Logf("tikv is in ScalePhase")
-				ginkgo.By("Wait for tc ready")
-				err = oa.WaitForTidbClusterReady(tc, 10*time.Minute, 10*time.Second)
-				framework.ExpectNoError(err, "failed to wait for TidbCluster %s/%s ready after scale in ", ns, tc.Name)
-				log.Logf("tc is ready")
-
-				scaleInTimeMap := make(map[int32]string)
-				ginkgo.By("Check PVC annotation tidb.pingcap.com/pvc-defer-deleting and scale-in-time")
-				err = wait.Poll(10*time.Second, 4*time.Minute, func() (done bool, err error) {
-					for ordinal := tcase.finalTiKVReplica; ordinal < tcase.originTiKVReplica; ordinal++ {
-						comp := v1alpha1.TiKVMemberType
-						var pvcSelector labels.Selector
-						pvcSelector, err = member.GetPVCSelectorForPod(tc, comp, int32(ordinal))
-						framework.ExpectNoError(err, "failed to get PVC selector for tc %s/%s", tc.GetNamespace(), tc.GetName())
-						pvcs, err := c.CoreV1().PersistentVolumeClaims(ns).List(context.TODO(), metav1.ListOptions{LabelSelector: pvcSelector.String()})
-						framework.ExpectNoError(err, "failed to list PVCs with selector: %v", pvcSelector)
-						for _, pvc := range pvcs.Items {
-							annotations := pvc.GetObjectMeta().GetAnnotations()
-							log.Logf("pvc annotations: %+v", annotations)
-							_, ok := annotations["tidb.pingcap.com/pvc-defer-deleting"]
-							if !ok {
-								log.Logf("PVC %s/%s does not have annotation tidb.pingcap.com/pvc-defer-deleting", pvc.GetNamespace(), pvc.GetName())
-								return false, nil
-							}
-							scaleInTimeMap[ordinal] = annotations[label.AnnPVCScaleInTime]
-						}
-					}
-					return true, nil
-				})
-				framework.ExpectNoError(err, "expect PVCs of scaled in Pods to have annotation tidb.pingcap.com/pvc-defer-deleting")
-				checkScaleInTime(scaleInTimeMap, tcase.scaleInGroups)
-			})
-		}
-	})
-
-	ginkgo.Describe("[Scale in simultaneously with asts]", func() {
-		var ocfg *tests.OperatorConfig
-		var oa *tests.OperatorActions
-		var genericCli ctrlCli.Client
-		var stsGetter typedappsv1.StatefulSetsGetter
-		var err error
-
-		ginkgo.BeforeEach(func() {
-			ocfg = e2econfig.NewDefaultOperatorConfig(cfg)
-			ocfg.Features = []string{
-				"StableScheduling=true",
-				"AdvancedStatefulSet=true",
+	ginkgo.DescribeTableSubtree("Leader Eviction", label.P1,
+		func(tls bool) {
+			if tls {
+				f.SetupCluster(data.WithClusterTLSEnabled())
 			}
-			oa = tests.NewOperatorActions(cli, c, asCli, aggrCli, apiExtCli, tests.DefaultPollInterval, ocfg, e2econfig.TestConfig, fw, f)
-			ginkgo.By("Installing CRDs")
-			oa.CleanCRDOrDie()
-			oa.CreateCRDOrDie(ocfg)
-			ginkgo.By("Installing tidb-operator")
-			oa.CleanOperatorOrDie(ocfg)
-			oa.DeployOperatorOrDie(ocfg)
-			genericCli, err = ctrlCli.New(config, ctrlCli.Options{Scheme: scheme.Scheme})
-			framework.ExpectNoError(err, "failed to create clientset")
-			stsGetter = astsHelper.NewHijackClient(c, asCli).AppsV1()
-		})
 
-		ginkgo.AfterEach(func() {
-			ginkgo.By("Uninstall tidb-operator")
-			oa.CleanOperatorOrDie(ocfg)
-			ginkgo.By("Uninstalling CRDs")
-			oa.CleanCRDOrDie()
-		})
+			ginkgo.It("leader evicted when delete tikv pod directly", func(ctx context.Context) {
+				if tls {
+					ns := f.Cluster.Namespace
+					cn := f.Cluster.Name
+					f.Must(cert.InstallTiDBIssuer(ctx, f.Client, ns, cn))
+					f.Must(cert.InstallTiDBCertificates(ctx, f.Client, ns, cn, "dbg"))
+					f.Must(cert.InstallTiDBComponentsCertificates(ctx, f.Client, ns, cn, "pdg", "kvg", "dbg", "flashg", "cdcg", "pg"))
+				}
+				pdg := f.MustCreatePD(ctx)
+				kvg := f.MustCreateTiKV(ctx,
+					data.WithReplicas[scope.TiKVGroup](3),
+				)
 
-		for _, tcase := range testCasesWithAsts {
-			tcase := tcase
-			ginkgo.It(tcase.description(), func() {
-				ginkgo.By("Deploy initial tc")
-				tc := fixture.GetTidbCluster(ns, fmt.Sprintf("scale-in-simultaneously-with-asts-%v", tcase.idx), utilimage.TiDBLatest)
-				tc.Spec.PD.Replicas = 1
-				tc.Spec.TiDB.Replicas = 1
-				tc.Spec.TiKV.Replicas = tcase.originTiKVReplica
-				setDeleteSlots(tc, tcase.originDeleteSlots)
-				utiltc.MustCreateTCWithComponentsReady(genericCli, oa, tc, 10*time.Minute, 10*time.Second)
+				f.WaitForPDGroupReady(ctx, pdg)
+				f.WaitForTiKVGroupReady(ctx, kvg)
 
-				err := controller.GuaranteedUpdate(genericCli, tc, func() error {
-					tc.Spec.TiKV.ScalePolicy = v1alpha1.ScalePolicy{
-						ScaleInParallelism: pointer.Int32Ptr(tcase.scaleInParallelism),
-					}
-					tc.Spec.TiKV.Replicas = tcase.finalTiKVReplica
-					setDeleteSlots(tc, tcase.finalDeleteSlots)
-					return nil
-				})
-				framework.ExpectNoError(err, "failed to scale in %s for TidbCluster /%s", ns, tc.Name)
+				kvs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+				f.Must(err)
 
-				var deleteSlotsList [][]int32
-				deleteSlotSets := sets.NewString()
-				ctx, cancel := context.WithCancel(context.Background())
-				ginkgo.By("Collect delete slots evolution async")
+				kv := kvs[0]
+
+				nctx, cancel := context.WithCancel(ctx)
+				ch := make(chan struct{})
 				go func() {
-					for {
-						select {
-						case <-ctx.Done():
-							return
-						default:
-						}
-						sts, err := stsGetter.StatefulSets(tc.Namespace).Get(context.TODO(), controller.TiKVMemberName(tc.Name), metav1.GetOptions{})
-						if err == nil {
-							s := sts.Annotations["delete-slots"]
-							if s != "" && !deleteSlotSets.Has(s) {
-								deleteSlotSets.Insert(s)
-								var slots []int32
-								_ = json.Unmarshal([]byte(s), &slots)
-								deleteSlotsList = append(deleteSlotsList, slots)
-							}
-						}
-						time.Sleep(time.Second * 3)
-					}
+					defer close(ch)
+					defer ginkgo.GinkgoRecover()
+					f.WaitTiKVPreStopHookSuccess(nctx, kv)
 				}()
 
-				log.Logf("tikv is in ScalePhase")
+				f.RestartTiKVPod(ctx, kv)
 
-				ginkgo.By("Wait for tc ready")
-				err = oa.WaitForTidbClusterReady(tc, 3*time.Minute, 10*time.Second)
-				framework.ExpectNoError(err, "failed to wait for TidbCluster %s/%s ready after scale in ", ns, tc.Name)
-				log.Logf("tc is ready")
-
-				scaleInTimeMap := make(map[int32]string)
-				ginkgo.By("Check PVC annotation tidb.pingcap.com/pvc-defer-deleting and scale-in-time")
-				err = wait.Poll(10*time.Second, 4*time.Minute, func() (done bool, err error) {
-					for _, ordinal := range tcase.scaleInOrdinals {
-						pvcSelector, err := member.GetPVCSelectorForPod(tc, v1alpha1.TiKVMemberType, int32(ordinal))
-						framework.ExpectNoError(err, "failed to get PVC selector for tc %s/%s", tc.GetNamespace(), tc.GetName())
-						pvcs, err := c.CoreV1().PersistentVolumeClaims(ns).List(context.TODO(), metav1.ListOptions{LabelSelector: pvcSelector.String()})
-						framework.ExpectNoError(err, "failed to list PVCs with selector: %v", pvcSelector)
-						for _, pvc := range pvcs.Items {
-							annotations := pvc.GetObjectMeta().GetAnnotations()
-							log.Logf("pvc annotations: %+v", annotations)
-							_, ok := annotations["tidb.pingcap.com/pvc-defer-deleting"]
-							if !ok {
-								log.Logf("PVC %s/%s does not have annotation tidb.pingcap.com/pvc-defer-deleting", pvc.GetNamespace(), pvc.GetName())
-							}
-							scaleInTimeMap[ordinal] = annotations[label.AnnPVCScaleInTime]
-						}
-					}
-					return true, nil
-				})
-				framework.ExpectNoError(err, "expect PVCs of scaled in Pods to have annotation tidb.pingcap.com/pvc-defer-deleting")
-				checkScaleInTime(scaleInTimeMap, tcase.scaleInGroups)
-
-				ginkgo.By("Check delete-slots evolution")
 				cancel()
-				framework.ExpectEqual(reflect.DeepEqual(tcase.deleteSlotsEvolutions, deleteSlotsList), true, "failed to check delete-slots with: %v, expected: %v", deleteSlotsList, tcase.deleteSlotsEvolutions)
+				<-ch
 			})
-		}
+		},
+		func(tls bool) string {
+			if tls {
+				return "TLS"
+			}
+			return "NO TLS"
+		},
+		ginkgo.Entry(nil, false),
+		ginkgo.Entry(nil, label.FeatureTLS, true),
+	)
+
+	ginkgo.Context("Race Condition Scenarios", label.P1, func() {
+		workload := f.SetupWorkload()
+
+		ginkgo.It("should recreate pod when deleted during graceful store removal", label.Delete, func(ctx context.Context) {
+			pdg := f.MustCreatePD(ctx, data.WithSlowDataMigration())
+			kvg := f.MustCreateTiKV(ctx, data.WithReplicas[scope.TiKVGroup](4))
+			dbg := f.MustCreateTiDB(ctx)
+
+			f.WaitForPDGroupReady(ctx, pdg)
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			f.WaitForTiDBGroupReady(ctx, dbg)
+			// Make sure each TiKV store has enough leaders and regions,
+			// otherwise the scale-in operation will be too fast.
+			workload.MustImportData(ctx, data.DefaultTiDBServiceName)
+
+			ginkgo.By("Initiating scale in from 4 to 3 replicas")
+			patch := client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](3)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			ginkgo.By("Finding the TiKV instance that is being scaled in")
+			offliningKVs := findOffliningTiKVs(ctx, f, kvg, 1)
+			gomega.Expect(offliningKVs).To(gomega.HaveLen(1), "Expected 1 TiKV instances to be marked for offline")
+			targetTiKV := offliningKVs[0]
+
+			ginkgo.By("Recording original pod information")
+			originalPod, err := apicall.GetPod[scope.TiKV](ctx, f.Client, targetTiKV)
+			f.Must(err)
+			originalPodUID := originalPod.UID
+
+			ginkgo.By("Simulating manual pod deletion during graceful shutdown")
+			// This simulates the race condition where user manually deletes the pod
+			// while the operator is trying to gracefully remove the store from PD
+			f.Must(f.Client.Delete(ctx, originalPod, client.GracePeriodSeconds(0)))
+
+			ginkgo.By("Verifying operator recreates the pod during store removal")
+
+			gomega.Eventually(func(g gomega.Gomega) {
+				// The operator should recreate the pod to ensure graceful store removal can complete
+				newPod, err := apicall.GetPod[scope.TiKV](ctx, f.Client, targetTiKV)
+				g.Expect(err).To(gomega.BeNil())
+				// Verify this is a new pod (different UID)
+				g.Expect(newPod.UID).ShouldNot(gomega.Equal(originalPodUID))
+
+				// Verify leaders are evicted
+				var tikv v1alpha1.TiKV
+				g.Expect(f.Client.Get(ctx, client.ObjectKeyFromObject(targetTiKV), &tikv)).To(gomega.Succeed())
+				g.Expect(meta.IsStatusConditionTrue(tikv.Status.Conditions, v1alpha1.TiKVCondLeadersEvicted)).To(gomega.BeTrue())
+			}, 3*time.Minute, 5*time.Second)
+
+			ginkgo.By("Verifying TiKV instance eventually completes removal")
+			f.Must(waiter.WaitForObjectDeleted(ctx, f.Client, targetTiKV, waiter.LongTaskTimeout))
+
+			ginkgo.By("Verifying TiKVGroup reaches desired state")
+			f.WaitForTiKVGroupReady(ctx, kvg)
+
+			ginkgo.By("Verifying final replica count")
+			finalTiKVs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+			f.Must(err)
+			gomega.Expect(finalTiKVs).To(gomega.HaveLen(3),
+				"Should have 3 TiKV instances after scale in from 4 to 3")
+		})
+
+		ginkgo.It("Evict leaders before deleting tikv", label.P1, label.Delete, func(ctx context.Context) {
+			pdg := f.MustCreatePD(ctx, data.WithSlowDataMigration())
+			kvg := f.MustCreateTiKV(ctx, data.WithReplicas[scope.TiKVGroup](4))
+			dbg := f.MustCreateTiDB(ctx)
+
+			f.WaitForPDGroupReady(ctx, pdg)
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			f.WaitForTiDBGroupReady(ctx, dbg)
+
+			// Make sure each TiKV store has enough leaders and regions,
+			// otherwise the scale-in operation will be too fast.
+			workload.MustImportData(ctx, data.DefaultTiDBServiceName)
+
+			nctx, cancel := context.WithCancel(ctx)
+			ch := make(chan struct{})
+			synced := make(chan struct{})
+			go func() {
+				defer close(ch)
+				defer ginkgo.GinkgoRecover()
+				f.Must(waiter.WatchUntilInstanceList[scope.TiKVGroup](
+					nctx,
+					f.Client,
+					kvg.DeepCopy(),
+					waiter.EvictLeaderBeforeStoreIsRemoving(1),
+					waiter.LongTaskTimeout,
+					synced,
+				))
+			}()
+			// wait until cache is synced
+			<-synced
+
+			ginkgo.By("Initiating scale in from 4 to 3 replicas")
+			patch := client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](3)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			cancel()
+			<-ch
+		})
 	})
 
+	ginkgo.Context("when scaling in TiKV with two-step deletion", label.Delete, func() {
+		workload := f.SetupWorkload()
+
+		ginkgo.It("should complete the full scale-in flow", func(ctx context.Context) {
+			pdg := f.MustCreatePD(ctx)
+			kvg := f.MustCreateTiKV(ctx, data.WithReplicas[scope.TiKVGroup](4))
+			dbg := f.MustCreateTiDB(ctx)
+
+			f.WaitForPDGroupReady(ctx, pdg)
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			f.WaitForTiDBGroupReady(ctx, dbg)
+			workload.MustImportData(ctx, data.DefaultTiDBServiceName)
+
+			ginkgo.By("Scaling in TiKV from 4 to 3 replica")
+			patch := client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](3)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			ginkgo.By("Verifying 1 TiKV instances are marked for offline")
+			offliningKVs := findOffliningTiKVs(ctx, f, kvg, 1)
+			gomega.Expect(offliningKVs).To(gomega.HaveLen(1), "Expected 1 TiKV instances to be marked for offline")
+			offlineTiKV := offliningKVs[0]
+			gomega.Expect(offlineTiKV.GetDeletionTimestamp().IsZero()).To(gomega.BeTrue(), "should not delete the tikv instance when it's going offline")
+
+			ginkgo.By("Waiting for offline operations to complete")
+			nctx, cancel := context.WithCancel(ctx)
+			ch := make(chan struct{})
+			synced := make(chan struct{})
+			go func() {
+				defer close(ch)
+				defer ginkgo.GinkgoRecover()
+				f.Must(waiter.WatchUntilInstanceList[scope.TiKVGroup](
+					nctx,
+					f.Client,
+					kvg.DeepCopy(),
+					waiter.WaitForTiKVOfflineCompleted(offlineTiKV),
+					waiter.LongTaskTimeout,
+					synced,
+				))
+			}()
+			// wait until cache is synced
+			<-synced
+
+			ginkgo.By("Verifying offlined TiKV instances are deleted")
+			waitForTiKVInstancesDeleted(ctx, f, offliningKVs, 5*time.Minute)
+			cancel()
+			<-ch
+
+			ginkgo.By("Verifying TiKVGroup reaches desired state of 3 replica")
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			finalTiKVs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+			f.Must(err)
+			gomega.Expect(finalTiKVs).To(gomega.HaveLen(3), "Should have 3 TiKV instance after scale in")
+		})
+
+		ginkgo.It("should handle full cancellation of scale-in", func(ctx context.Context) {
+			// Slow down the speed of data migration for testing
+			pdg := f.MustCreatePD(ctx, data.GroupPatchFunc[*v1alpha1.PDGroup](func(pdg *v1alpha1.PDGroup) {
+				pdg.Spec.Template.Spec.Config = `[schedule]
+region-schedule-limit = 16
+replica-schedule-limit = 8
+`
+			}))
+			kvg := f.MustCreateTiKV(ctx, data.WithReplicas[scope.TiKVGroup](4))
+			dbg := f.MustCreateTiDB(ctx)
+
+			f.WaitForPDGroupReady(ctx, pdg)
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			f.WaitForTiDBGroupReady(ctx, dbg)
+			workload.MustImportData(ctx, data.DefaultTiDBServiceName)
+
+			ginkgo.By("Scaling in TiKV from 4 to 3 replica")
+			patch := client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](3)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+			offliningKVs := findOffliningTiKVs(ctx, f, kvg, 1)
+			gomega.Expect(offliningKVs).To(gomega.HaveLen(1))
+
+			ginkgo.By("Cancelling scale-in by scaling back to 4 replicas")
+			patch = client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](4)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			ginkgo.By("Verifying offline operations are cancelled")
+			// When offline operation is cancelled, the TiKV instance should no longer be marked for offline
+			gomega.Eventually(func(g gomega.Gomega) {
+				instance := &v1alpha1.TiKV{}
+				g.Expect(f.Client.Get(ctx, client.ObjectKeyFromObject(offliningKVs[0]), instance)).To(gomega.Succeed())
+				g.Expect(coreutil.IsOffline[scope.TiKV](instance)).To(gomega.BeFalse(), "TiKV instance should not be marked for offline after cancellation")
+				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, v1alpha1.StoreOfflinedConditionType)).To(gomega.BeNil(), "StoreOffline condition should not exist")
+			}, 3*time.Minute, 10*time.Second).Should(gomega.Succeed())
+
+			ginkgo.By("check if it's evicting leaders")
+			tikvGet := &v1alpha1.TiKV{}
+			gomega.Expect(f.Client.Get(ctx, client.ObjectKeyFromObject(offliningKVs[0]), tikvGet)).To(gomega.Succeed())
+			cond := meta.FindStatusCondition(tikvGet.Status.Conditions, v1alpha1.TiKVCondLeadersEvicted)
+			gomega.Expect(cond).NotTo(gomega.BeNil(), "LeadersEvicted condition should exist")
+			gomega.Expect(cond.Status).Should(gomega.Equal(metav1.ConditionFalse))
+			time.Sleep(10 * time.Second)
+
+			ginkgo.By("Verifying TiKVGroup stabilizes at 4 replicas")
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			finalTiKVs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+			f.Must(err)
+			gomega.Expect(finalTiKVs).To(gomega.HaveLen(4))
+			for _, kv := range finalTiKVs {
+				gomega.Expect(coreutil.IsOffline[scope.TiKV](kv)).To(gomega.BeFalse())
+			}
+		})
+
+		ginkgo.It("should handle partial cancellation of scale-in", func(ctx context.Context) {
+			// Slow down the speed of data migration for testing
+			pdg := f.MustCreatePD(ctx, data.GroupPatchFunc[*v1alpha1.PDGroup](func(pdg *v1alpha1.PDGroup) {
+				pdg.Spec.Template.Spec.Config = `[schedule]
+region-schedule-limit = 32
+replica-schedule-limit = 16
+`
+			}))
+			kvg := f.MustCreateTiKV(ctx, data.WithReplicas[scope.TiKVGroup](5))
+			dbg := f.MustCreateTiDB(ctx)
+
+			f.WaitForPDGroupReady(ctx, pdg)
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			f.WaitForTiDBGroupReady(ctx, dbg)
+			workload.MustImportData(ctx, data.DefaultTiDBServiceName)
+
+			ginkgo.By("Scaling in TiKV from 5 to 3 replicas")
+			patch := client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](3)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			ginkgo.By("Verifying 2 TiKV instances are marked for offline")
+			offliningKVs := findOffliningTiKVs(ctx, f, kvg, 2)
+			gomega.Expect(offliningKVs).To(gomega.HaveLen(2))
+
+			ginkgo.By("Partially cancelling by scaling up to 4 replicas")
+			patch = client.MergeFrom(kvg.DeepCopy())
+			kvg.Spec.Replicas = ptr.To[int32](4)
+			f.Must(f.Client.Patch(ctx, kvg, patch))
+
+			ginkgo.By("Verifying one offline operation is cancelled and the other continue")
+			var cancelledKVs, remainingOffliningKVs []*v1alpha1.TiKV
+			gomega.Eventually(func(g gomega.Gomega) {
+				cancelledKVs = nil
+				remainingOffliningKVs = nil
+				for _, kv := range offliningKVs {
+					instance := &v1alpha1.TiKV{}
+					g.Expect(f.Client.Get(ctx, client.ObjectKeyFromObject(kv), instance)).To(gomega.Succeed())
+					if !coreutil.IsOffline[scope.TiKV](instance) {
+						cancelledKVs = append(cancelledKVs, instance)
+					} else {
+						remainingOffliningKVs = append(remainingOffliningKVs, instance)
+					}
+				}
+				g.Expect(cancelledKVs).To(gomega.HaveLen(1), "Expected 1 offline operation to be cancelled")
+				g.Expect(remainingOffliningKVs).To(gomega.HaveLen(1), "Expected 1 offline operations to continue")
+			}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed())
+
+			ginkgo.By("Verifying the cancelled instance status is updated")
+			// When offline operation is cancelled, the TiKV instance should no longer be marked for offline
+			gomega.Eventually(func(g gomega.Gomega) {
+				instance := &v1alpha1.TiKV{}
+				g.Expect(f.Client.Get(ctx, client.ObjectKeyFromObject(cancelledKVs[0]), instance)).To(gomega.Succeed())
+				g.Expect(coreutil.IsOffline[scope.TiKV](instance)).To(gomega.BeFalse(), "Cancelled TiKV instance should not be marked for offline")
+				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, v1alpha1.StoreOfflinedConditionType)).To(gomega.BeNil(), "StoreOffline condition should not exist")
+			}, 3*time.Minute, 10*time.Second).Should(gomega.Succeed())
+
+			ginkgo.By("Waiting for the remaining offline operations to complete")
+			nctx, cancel := context.WithCancel(ctx)
+			ch := make(chan struct{})
+			synced := make(chan struct{})
+			go func() {
+				defer close(ch)
+				defer ginkgo.GinkgoRecover()
+				f.Must(waiter.WatchUntilInstanceList[scope.TiKVGroup](
+					nctx,
+					f.Client,
+					kvg.DeepCopy(),
+					waiter.WaitForTiKVOfflineCompleted(remainingOffliningKVs[0]),
+					waiter.LongTaskTimeout,
+					synced,
+				))
+			}()
+			// wait until cache is synced
+			<-synced
+
+			ginkgo.By("Verifying offlined TiKV instances are deleted")
+			waitForTiKVInstancesDeleted(ctx, f, remainingOffliningKVs, 5*time.Minute)
+			cancel()
+			<-ch
+
+			ginkgo.By("Verifying TiKVGroup stabilizes at 4 replicas")
+			f.WaitForTiKVGroupReady(ctx, kvg)
+			finalTiKVs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+			f.Must(err)
+			gomega.Expect(finalTiKVs).To(gomega.HaveLen(4))
+		})
+	})
 })
 
-func checkScaleInTime(scaleInTimeMap map[int32]string, groups [][]int32) {
-	timeSet := sets.NewString()
-	for _, group := range groups {
-		subTimeSet := sets.NewString()
-		for _, oridinal := range group {
-			t, ok := scaleInTimeMap[oridinal]
-			framework.ExpectEqual(true, ok, "scale in time of oridinal %v not found", oridinal)
-			subTimeSet.Insert(t)
-			timeSet.Insert(t)
+// findOffliningTiKVs waits and finds a specific number of TiKV instances that are being offlined.
+func findOffliningTiKVs(ctx context.Context, f *framework.Framework, kvg *v1alpha1.TiKVGroup, expectedCount int) []*v1alpha1.TiKV {
+	var offliningKVs []*v1alpha1.TiKV
+	gomega.Eventually(func() bool {
+		allKVs, err := apicall.ListInstances[scope.TiKVGroup](ctx, f.Client, kvg)
+		if err != nil {
+			return false
 		}
-		framework.ExpectEqual(len(subTimeSet), 1, "scale in time in group %v deffers, actual scaleInTimeMap: %v", group, scaleInTimeMap)
-	}
-	framework.ExpectEqual(len(timeSet), len(groups), "scale in time not match with groups, actual scaleInTimeMap: %v", scaleInTimeMap)
+		offliningKVs = nil
+		for _, kv := range allKVs {
+			if coreutil.IsOffline[scope.TiKV](kv) {
+				offliningKVs = append(offliningKVs, kv)
+			}
+		}
+		return len(offliningKVs) == expectedCount
+	}, 5*time.Minute, 5*time.Second).Should(gomega.BeTrue(), fmt.Sprintf("timed out waiting for %d offlining TiKV instances", expectedCount))
+	return offliningKVs
 }
 
-func setDeleteSlots(tc *v1alpha1.TidbCluster, deleteSlots sets.Int32) {
-	if tc.Annotations == nil {
-		tc.Annotations = make(map[string]string)
+// waitForTiKVInstancesDeleted waits for a list of TiKV instances to be completely removed.
+func waitForTiKVInstancesDeleted(ctx context.Context, f *framework.Framework, kvs []*v1alpha1.TiKV, timeout time.Duration) {
+	for _, kv := range kvs {
+		f.Must(waiter.WaitForObjectDeleted(ctx, f.Client, kv, timeout))
 	}
-	if deleteSlots == nil || deleteSlots.Len() == 0 {
-		delete(tc.Annotations, label.AnnTiKVDeleteSlots)
-	} else {
-		tc.Annotations[label.AnnTiKVDeleteSlots] = mustToString(deleteSlots)
-	}
-}
-
-func mustToString(set sets.Int32) string {
-	b, err := json.Marshal(set.List())
-	if err != nil {
-		panic(err)
-	}
-	return string(b)
 }

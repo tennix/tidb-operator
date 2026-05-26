@@ -1,0 +1,29 @@
+apiVersion: core.pingcap.com/v1alpha1
+kind: TiFlashGroup
+metadata:
+  name: tiflash
+  labels:
+    pingcap.com/group: tiflash
+    pingcap.com/component: tiflash
+    pingcap.com/cluster: basic
+spec:
+  cluster:
+    name: basic
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        author: pingcap
+    spec:
+      version: v8.5.2
+      resources:
+        cpu: "4"
+        memory: 8Gi
+      config: |
+        mark_cache_size = 1073741824
+      proxyConfig: ""
+      volumes:
+      - name: data
+        mounts:
+        - type: data
+        storage: 100Gi

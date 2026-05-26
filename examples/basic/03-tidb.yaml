@@ -1,0 +1,24 @@
+apiVersion: core.pingcap.com/v1alpha1
+kind: TiDBGroup
+metadata:
+  name: tidb
+  labels:
+    pingcap.com/group: tidb
+    pingcap.com/component: tidb
+    pingcap.com/cluster: basic
+spec:
+  cluster:
+    name: basic
+  replicas: 2
+  template:
+    metadata:
+      annotations:
+        author: pingcap
+    spec:
+      version: v8.5.2
+      resources:
+        cpu: "1"
+        memory: 2Gi
+      config: |
+        [log]
+        level = "debug"

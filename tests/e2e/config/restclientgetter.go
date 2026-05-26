@@ -1,4 +1,4 @@
-// Copyright 2019 PingCAP, Inc.
+// Copyright 2024 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -28,6 +29,10 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/util/homedir"
+)
+
+const (
+	discoveryCacheTTL = 10 * time.Minute
 )
 
 var defaultCacheDir = filepath.Join(homedir.HomeDir(), ".kube", "http-cache")
@@ -54,7 +59,7 @@ func (getter *simpleRestClientGetter) ToDiscoveryClient() (discovery.CachedDisco
 	httpCacheDir := defaultCacheDir
 	discoveryCacheDir := computeDiscoverCacheDir(filepath.Join(homedir.HomeDir(), ".kube", "cache", "discovery"), config.Host)
 
-	return diskcached.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, time.Duration(10*time.Minute))
+	return diskcached.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, discoveryCacheTTL)
 }
 
 // ToRESTMapper returns a restmapper
@@ -65,7 +70,7 @@ func (getter *simpleRestClientGetter) ToRESTMapper() (meta.RESTMapper, error) {
 	}
 
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
-	expander := restmapper.NewShortcutExpander(mapper, discoveryClient)
+	expander := restmapper.NewShortcutExpander(mapper, discoveryClient, nil)
 	return expander, nil
 }
 
@@ -74,19 +79,21 @@ func (getter *simpleRestClientGetter) ToRawKubeConfigLoader() clientcmd.ClientCo
 	return clientcmd.NewDefaultClientConfig(getter.Config, &clientcmd.ConfigOverrides{ClusterDefaults: clientcmd.ClusterDefaults})
 }
 
-// overlyCautiousIllegalFileCharacters matches characters that *might* not be supported.  Windows is really restrictive, so this is really restrictive
-var overlyCautiousIllegalFileCharacters = regexp.MustCompile(`[^(\w/\.)]`)
+// overlyCautiousIllegalFileCharacters matches characters that *might* not be supported.
+// Windows is really restrictive, so this is really restrictive
+var overlyCautiousIllegalFileCharacters = regexp.MustCompile(`[^(\w/.)]`)
 
 // computeDiscoverCacheDir takes the parentDir and the host and comes up with a "usually non-colliding" name.
 func computeDiscoverCacheDir(parentDir, host string) string {
 	// strip the optional scheme from host if its there:
 	schemelessHost := strings.Replace(strings.Replace(host, "https://", "", 1), "http://", "", 1)
-	// now do a simple collapse of non-AZ09 characters.  Collisions are possible but unlikely.  Even if we do collide the problem is short lived
+	// now do a simple collapse of non-AZ09 characters.
+	// Collisions are possible but unlikely.  Even if we do collide the problem is short lived
 	safeHost := overlyCautiousIllegalFileCharacters.ReplaceAllString(schemelessHost, "_")
 	return filepath.Join(parentDir, safeHost)
 }
 
 // NewSimpleRESTClientGetter initializes a new genericclioptions.RESTClientGetter from clientcmdapi.Config.
-func NewSimpleRESTClientGetter(config clientcmdapi.Config) genericclioptions.RESTClientGetter {
-	return &simpleRestClientGetter{config}
+func NewSimpleRESTClientGetter(config *clientcmdapi.Config) genericclioptions.RESTClientGetter {
+	return &simpleRestClientGetter{*config}
 }

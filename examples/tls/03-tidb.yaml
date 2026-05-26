@@ -1,0 +1,22 @@
+apiVersion: core.pingcap.com/v1alpha1
+kind: TiDBGroup
+metadata:
+  name: tidb
+  labels:
+    pingcap.com/group: tidb
+    pingcap.com/component: tidb
+    pingcap.com/cluster: tls
+spec:
+  cluster:
+    name: tls
+  version: v8.5.2
+  replicas: 1
+  template:
+    spec:
+      security:
+        tls:
+          mysql:
+            enabled: true
+      config: |
+        [security]
+        cluster-verify-cn = ["TiDB"]

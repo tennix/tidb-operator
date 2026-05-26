@@ -16,46 +16,12 @@ We truncate at 63 chars because some Kubernetes name fields are limited to this 
 {{- end -}}
 
 {{/*
-Define the default value for cluster permissions variables. They should be `true` by default for back compatibility.
-It seems `ternary` is not short-circuit evaluation, so we can't combine multiple `ternary` into one line here and need to use `if` instead.
+It is copied from https://github.com/cert-manager/cert-manager/blob/v1.17.2/deploy/charts/cert-manager/templates/_helpers.tpl
 */}}
-{{- define "controller-manager.cluster-permissions.nodes" -}}
-{{- if hasKey .Values.controllerManager "clusterPermissions" }}
-{{ hasKey .Values.controllerManager.clusterPermissions "nodes" | ternary .Values.controllerManager.clusterPermissions.nodes true }}
-{{- else }}
-true
+{{- define "image" -}}
+{{- $defaultTag := index . 1 -}}
+{{- with index . 0 -}}
+{{- if .registry -}}{{ printf "%s/%s" .registry .repository }}{{- else -}}{{- .repository -}}{{- end -}}
+{{- if .digest -}}{{ printf "@%s" .digest }}{{- else -}}{{ printf ":%s" (default $defaultTag .tag) }}{{- end -}}
 {{- end }}
 {{- end }}
-
-{{- define "controller-manager.cluster-permissions.persistentvolumes" -}}
-{{- if hasKey .Values.controllerManager "clusterPermissions" }}
-{{ hasKey .Values.controllerManager.clusterPermissions "persistentvolumes" | ternary .Values.controllerManager.clusterPermissions.persistentvolumes true }}
-{{- else }}
-true
-{{- end }}
-{{- end }}
-
-{{- define "controller-manager.cluster-permissions.storageclasses" -}}
-{{- if hasKey .Values.controllerManager "clusterPermissions" }}
-{{ hasKey .Values.controllerManager.clusterPermissions "storageclasses" | ternary .Values.controllerManager.clusterPermissions.storageclasses true }}
-{{- else }}
-true
-{{- end }}
-{{- end }}
-
-{{- define "helm-toolkit.utils.template" -}}
-{{- $name := index . 0 -}}
-{{- $context := index . 1 -}}
-{{- $last := base $context.Template.Name }}
-{{- $wtf := $context.Template.Name | replace $last $name -}}
-{{ include $wtf $context }}
-{{- end }}
-
-{{/*
-By default, we extract the v<major>.<minor>.<patch> part from the KubeVersion, e.g.
-- v1.17.1+3f6f40d -> v1.17.1 (OpenShift)
-- v1.15.11-gke.15 -> v1.15.11 (GKE)
-*/}}
-{{- define "kube-scheduler.image_tag" -}}
-{{- default (regexFind "^v\\d+\\.\\d+\\.\\d+" .Capabilities.KubeVersion.GitVersion) .Values.scheduler.kubeSchedulerImageTag -}}
-{{- end -}}

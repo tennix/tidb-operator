@@ -1,0 +1,84 @@
+{{- if .Values.rbac.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  {{- if eq .Values.appendReleaseSuffix true}}
+  name: {{ .Values.operator.serviceAccount }}-{{ .Release.Name }}
+  {{- else }}
+  name: {{ .Values.operator.serviceAccount }}
+  {{- end }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ template "chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: tidb-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}:tidb-operator
+  labels:
+    app.kubernetes.io/name: {{ template "chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: tidb-operator
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps", "persistentvolumeclaims", "pods", "services"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumes", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["controllerrevisions", "statefulsets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["core.pingcap.com"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["br.pingcap.com"]
+    resources: ["*"]
+    verbs: ["*"]
+  {{- if eq .Values.skipCRDsManagement false }}
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "create", "update", "patch"]
+    resourceNames: {{ toYaml .Values.crds | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}:tidb-operator
+  labels:
+    app.kubernetes.io/name: {{ template "chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: tidb-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}:tidb-operator
+subjects:
+  - kind: ServiceAccount
+    {{- if eq .Values.appendReleaseSuffix true}}
+    name: {{ .Values.operator.serviceAccount }}-{{ .Release.Name }}
+    {{- else }}
+    name: {{ .Values.operator.serviceAccount }}
+    {{- end }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

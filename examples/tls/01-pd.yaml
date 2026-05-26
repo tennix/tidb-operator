@@ -1,0 +1,23 @@
+apiVersion: core.pingcap.com/v1alpha1
+kind: PDGroup
+metadata:
+  name: pd
+  labels:
+    pingcap.com/group: pd
+    pingcap.com/component: pd
+    pingcap.com/cluster: tls
+spec:
+  cluster:
+    name: tls
+  version: v8.5.2
+  replicas: 3
+  template:
+    spec:
+      config: |
+        [security]
+        cert-allowed-cn = ["TiDB"]
+      volumes:
+      - name: data
+        mounts:
+        - type: data
+        storage: 20Gi

@@ -1,4 +1,4 @@
-// Copyright 2020 PingCAP, Inc.
+// Copyright 2024 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -15,75 +16,367 @@ package framework
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
-	"github.com/onsi/ginkgo"
-	"github.com/pingcap/tidb-operator/pkg/apis/label"
-	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
 
-	framework "github.com/pingcap/tidb-operator/tests/third_party/k8s"
-	"github.com/pingcap/tidb-operator/tests/third_party/k8s/log"
+	"github.com/pingcap/tidb-operator/api/v2/core/v1alpha1"
+	metav1alpha1 "github.com/pingcap/tidb-operator/api/v2/meta/v1alpha1"
+	"github.com/pingcap/tidb-operator/v2/pkg/client"
+	"github.com/pingcap/tidb-operator/v2/pkg/runtime"
+	"github.com/pingcap/tidb-operator/v2/pkg/runtime/scope"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/data"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/framework/desc"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/label"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/waiter"
 )
 
-func NewDefaultFramework(baseName string) *framework.Framework {
-	f := framework.NewDefaultFramework(baseName)
-	var c kubernetes.Interface
-	ginkgo.BeforeEach(func() {
-		c = f.ClientSet
-	})
-	ginkgo.AfterEach(func() {
-		// tidb-operator may set persistentVolumeReclaimPolicy to Retain if
-		// users request this. To reduce storage usage, we try to recycle them
-		// if the PVC namespace does not exist anymore.
-		pvList, err := c.CoreV1().PersistentVolumes().List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			log.Logf("failed to list pvs: %v", err)
-			return
-		}
-		var (
-			total          int = len(pvList.Items)
-			retainReleased int
-			skipped        int
-			failed         int
-			succeeded      int
-		)
-		defer func() {
-			log.Logf("recycling orphan PVs (total: %d, retainReleased: %d, skipped: %d, failed: %d, succeeded: %d)", total, retainReleased, skipped, failed, succeeded)
-		}()
-		for _, pv := range pvList.Items {
-			if pv.Spec.PersistentVolumeReclaimPolicy != v1.PersistentVolumeReclaimRetain || pv.Status.Phase != v1.VolumeReleased {
-				continue
-			}
-			retainReleased++
-			pvcNamespaceName, ok := pv.Labels[label.NamespaceLabelKey]
-			if !ok {
-				log.Logf("label %q does not exist in PV %q", label.NamespaceLabelKey, pv.Name)
-				failed++
-				continue
-			}
-			_, err := c.CoreV1().Namespaces().Get(context.TODO(), pvcNamespaceName, metav1.GetOptions{})
-			if err != nil && !apierrors.IsNotFound(err) {
-				log.Logf("failed to get namespace %q: %v", pvcNamespaceName, err)
-				failed++
-				continue
-			}
-			if !apierrors.IsNotFound(err) {
-				skipped++
-				continue
-			}
-			// now we can safely recycle the PV
-			pv.Spec.PersistentVolumeReclaimPolicy = v1.PersistentVolumeReclaimDelete
-			_, err = c.CoreV1().PersistentVolumes().Update(context.TODO(), &pv, metav1.UpdateOptions{})
-			if err != nil {
-				failed++
-				log.Logf("failed to set PersistentVolumeReclaimPolicy of PV %q to Delete: %v", pv.Name, err)
+type Framework struct {
+	Namespace *corev1.Namespace
+	Cluster   *v1alpha1.Cluster
+
+	Client client.Client
+
+	restConfig *rest.Config
+	podClient  rest.Interface
+
+	clusterPatches []data.ClusterPatch
+}
+
+func New() *Framework {
+	return &Framework{}
+}
+
+type SetupOptions struct {
+	SkipWaitForClusterDeleted    bool
+	SkipWaitForNamespaceDeleted  bool
+	SkipClusterCreation          bool
+	SkipClusterDeletedWhenFailed bool
+}
+
+type SetupOption func(opts *SetupOptions)
+
+func WithSkipWaitForClusterDeleted() SetupOption {
+	return func(opts *SetupOptions) {
+		opts.SkipWaitForClusterDeleted = true
+	}
+}
+
+func WithSkipWaitForNamespaceDeleted() SetupOption {
+	return func(opts *SetupOptions) {
+		opts.SkipWaitForNamespaceDeleted = true
+	}
+}
+
+func WithSkipClusterCreation() SetupOption {
+	return func(opts *SetupOptions) {
+		opts.SkipClusterCreation = true
+	}
+}
+
+func WithSkipClusterDeletionWhenFailed() SetupOption {
+	return func(opts *SetupOptions) {
+		opts.SkipClusterDeletedWhenFailed = true
+	}
+}
+
+func (f *Framework) Setup(opts ...SetupOption) {
+	options := &SetupOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	// TODO: get context and config path from options
+	cfg, err := NewConfig("", "")
+	gomega.Expect(err).To(gomega.Succeed())
+	f.restConfig = cfg
+
+	c, err := newClient(cfg)
+	gomega.Expect(err).To(gomega.Succeed())
+	f.Client = c
+
+	podClient, err := newRESTClientForPod(cfg)
+	gomega.Expect(err).To(gomega.Succeed())
+	f.podClient = podClient
+
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		ns := data.NewNamespace()
+
+		f.Namespace = ns
+		ginkgo.By(fmt.Sprintf("Creating a namespace %s", f.Namespace.Name))
+		f.Must(f.Client.Create(ctx, f.Namespace))
+
+		ginkgo.DeferCleanup(func(ctx context.Context) {
+			if options.SkipClusterDeletedWhenFailed && ginkgo.CurrentSpecReport().Failed() {
+				ginkgo.By(fmt.Sprintf("Case failed, skip cluster deletion: %s", f.Cluster.Name))
 			} else {
-				succeeded++
-				log.Logf("successfully set PersistentVolumeReclaimPolicy of PV %q to Delete", pv.Name)
+				ginkgo.By(fmt.Sprintf("Delete the namespace %s", f.Namespace.Name))
+				f.Must(f.Client.Delete(ctx, f.Namespace))
+
+				if !options.SkipWaitForNamespaceDeleted {
+					ginkgo.By(fmt.Sprintf("Ensure the namespace %s can be deleted", f.Namespace.Name))
+					f.Must(waiter.WaitForObjectDeleted(ctx, f.Client, f.Namespace, waiter.LongTaskTimeout))
+				}
 			}
-		}
+		})
 	})
-	return f
+
+	if !options.SkipClusterCreation {
+		ginkgo.JustBeforeEach(func(ctx context.Context) {
+			f.Cluster = data.NewCluster(f.Namespace.Name, f.clusterPatches...)
+			ginkgo.By("Creating a cluster")
+			f.Must(f.Client.Create(ctx, f.Cluster))
+
+			ginkgo.DeferCleanup(func(ctx context.Context) {
+				if options.SkipClusterDeletedWhenFailed && ginkgo.CurrentSpecReport().Failed() {
+					ginkgo.By(fmt.Sprintf("Case failed, skip cluster deletion: %s", f.Cluster.Name))
+				} else {
+					ginkgo.By(fmt.Sprintf("Delete the cluster: %s", f.Cluster.Name))
+					f.Must(f.Client.Delete(ctx, f.Cluster))
+
+					if !options.SkipWaitForClusterDeleted {
+						ginkgo.By(fmt.Sprintf("Ensure the cluster: %s can be deleted", f.Cluster.Name))
+						f.Must(waiter.WaitForObjectDeleted(ctx, f.Client, f.Cluster, waiter.LongTaskTimeout))
+					}
+				}
+			})
+		})
+	}
+}
+
+func (f *Framework) SetupCluster(ps ...data.ClusterPatch) {
+	ginkgo.BeforeEach(func(context.Context) {
+		f.clusterPatches = ps
+	})
+	ginkgo.AfterEach(func(context.Context) {
+		f.clusterPatches = nil
+	})
+}
+
+func (f *Framework) MustCreateCluster(ctx context.Context, ps ...data.ClusterPatch) *v1alpha1.Cluster {
+	tc := data.NewCluster(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a cluster")
+	f.Must(f.Client.Create(ctx, tc))
+
+	return tc
+}
+
+// Deprecated: use action.MustCreatePD
+func (f *Framework) MustCreatePD(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.PDGroup]) *v1alpha1.PDGroup {
+	pdg := data.NewPDGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a pd group")
+	f.Must(f.Client.Create(ctx, pdg))
+
+	return pdg
+}
+
+// Deprecated: use action.MustCreateTiDB
+func (f *Framework) MustCreateTiDB(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.TiDBGroup]) *v1alpha1.TiDBGroup {
+	dbg := data.NewTiDBGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a tidb group")
+	f.Must(f.Client.Create(ctx, dbg))
+
+	return dbg
+}
+
+// Deprecated: use action.MustCreateTSO
+func (f *Framework) MustCreateTSO(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.TSOGroup]) *v1alpha1.TSOGroup {
+	tg := data.NewTSOGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a tso group")
+	f.Must(f.Client.Create(ctx, tg))
+
+	return tg
+}
+
+// Deprecated: use action.MustCreateScheduling
+func (f *Framework) MustCreateScheduling(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.SchedulingGroup]) *v1alpha1.SchedulingGroup {
+	sg := data.NewSchedulingGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a scheduler group")
+	f.Must(f.Client.Create(ctx, sg))
+	return sg
+}
+
+// Deprecated: use action.MustCreateResourceManager
+func (f *Framework) MustCreateResourceManager(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.ResourceManagerGroup]) *v1alpha1.ResourceManagerGroup {
+	sg := data.NewResourceManagerGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a resource manager group")
+	f.Must(f.Client.Create(ctx, sg))
+	return sg
+}
+
+// Deprecated: use action.MustCreateTiProxy
+func (f *Framework) MustCreateTiProxy(ctx context.Context, ps ...data.GroupPatch[*v1alpha1.TiProxyGroup]) *v1alpha1.TiProxyGroup {
+	tpg := data.NewTiProxyGroup(f.Namespace.Name, ps...)
+	ginkgo.By("Creating a tiproxy group")
+	f.Must(f.Client.Create(ctx, tpg))
+	return tpg
+}
+
+func (f *Framework) SetupBootstrapSQL(sql string) {
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      data.BootstrapSQLName,
+				Namespace: f.Namespace.Name,
+			},
+			Data: map[string]string{
+				v1alpha1.ConfigMapKeyBootstrapSQL: sql,
+			},
+		}
+		ginkgo.By("Creating a bootstrap sql configmap")
+		f.Must(f.Client.Create(ctx, cm))
+		ginkgo.DeferCleanup(func(ctx context.Context) {
+			ginkgo.By("Delete the bootstrap sql configmap")
+			f.Must(f.Client.Delete(ctx, cm))
+		})
+	})
+}
+
+func (f *Framework) SetupSEMConfig(cfg string) {
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      data.SEMConfigName,
+				Namespace: f.Namespace.Name,
+			},
+			Data: map[string]string{
+				v1alpha1.FileNameSEMConfig: cfg,
+			},
+		}
+		ginkgo.By("Creating a sem configmap")
+		f.Must(f.Client.Create(ctx, cm))
+		ginkgo.DeferCleanup(func(ctx context.Context) {
+			ginkgo.By("Delete the sem configmap")
+			f.Must(f.Client.Delete(ctx, cm))
+		})
+	})
+}
+
+func (*Framework) Must(err error) {
+	gomega.ExpectWithOffset(1, err).To(gomega.Succeed())
+}
+
+func (*Framework) True(b bool, opts ...any) {
+	gomega.ExpectWithOffset(1, b).To(gomega.BeTrue(), opts...)
+}
+
+// Deprecated: use f.Describe
+// DescribeFeatureTable generates a case with different features
+func (*Framework) DescribeFeatureTable(f func(fs ...metav1alpha1.Feature), fss ...[]metav1alpha1.Feature) {
+	var entries []ginkgo.TableEntry
+	for _, fs := range fss {
+		var args []any
+		args = append(args, label.Features(fs...))
+		for _, f := range fs {
+			args = append(args, f)
+		}
+		entries = append(entries, ginkgo.Entry(nil, args...))
+	}
+	var args []any
+	args = append(args, f)
+	args = append(args,
+		func(fs ...metav1alpha1.Feature) string {
+			sb := strings.Builder{}
+			for _, f := range fs {
+				sb.WriteString("[")
+				sb.WriteString(string(f))
+				sb.WriteString("]")
+			}
+			return sb.String()
+		},
+	)
+	for _, entry := range entries {
+		args = append(args, entry)
+	}
+	ginkgo.DescribeTableSubtree("FeatureTable", args...)
+}
+
+func (f *Framework) PortForwardPod(ctx context.Context, pod *corev1.Pod, ports []string) []portforward.ForwardedPort {
+	readyCh := make(chan struct{})
+	pf, err := newPodPortForwarder(ctx, f.restConfig, f.podClient, pod, ports, readyCh, ginkgo.GinkgoWriter)
+	f.Must(err)
+	go func() {
+		defer ginkgo.GinkgoRecover()
+		f.Must(pf.ForwardPorts())
+	}()
+	<-readyCh
+	ps, err := pf.GetPorts()
+	f.Must(err)
+
+	return ps
+}
+
+func AsyncWaitPodsRollingUpdateOnce[
+	S scope.Group[F, T],
+	F client.Object,
+	T runtime.Group,
+](ctx context.Context, f *Framework, obj F, to int) chan struct{} {
+	maxSurge := rollingUpdateMaxSurge(obj)
+	ch := make(chan struct{})
+	nobj := obj.DeepCopyObject().(F)
+	go func() {
+		defer close(ch)
+		defer ginkgo.GinkgoRecover()
+		f.Must(waiter.WaitPodsRollingUpdateOnce[S](ctx, f.Client, nobj, to, maxSurge, waiter.LongTaskTimeout))
+	}()
+
+	return ch
+}
+
+func rollingUpdateMaxSurge(obj client.Object) int {
+	switch g := obj.(type) {
+	case *v1alpha1.TiDBGroup:
+		if g.Spec.MaxSurge != nil {
+			return int(*g.Spec.MaxSurge)
+		}
+		return 1
+	case *v1alpha1.TiProxyGroup:
+		if g.Spec.MaxSurge != nil {
+			return int(*g.Spec.MaxSurge)
+		}
+		return 1
+	case *v1alpha1.TiCDCGroup:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (f *Framework) Describe(fn func(o *desc.Options), optss ...[]desc.Option) {
+	var entries []ginkgo.TableEntry
+	for _, opts := range optss {
+		o := desc.DefaultOptions()
+		for _, opt := range opts {
+			opt.With(o)
+		}
+		var args []any
+		args = append(args, o.Labels())
+		args = append(args, o)
+		if o.Focus {
+			args = append(args, ginkgo.Focus)
+		}
+		entries = append(entries, ginkgo.Entry(nil, args...))
+	}
+	var args []any
+	args = append(args, func(o *desc.Options) {
+		ginkgo.JustBeforeEach(func() {
+			o.Namespace = f.Namespace.Name
+		})
+		fn(o)
+	})
+	args = append(args,
+		func(o *desc.Options) string {
+			return o.String()
+		},
+	)
+	for _, entry := range entries {
+		args = append(args, entry)
+	}
+	ginkgo.DescribeTableSubtree("Describe", args...)
 }

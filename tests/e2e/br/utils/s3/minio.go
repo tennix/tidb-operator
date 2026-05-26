@@ -1,4 +1,4 @@
-// Copyright 2021 PingCAP, Inc.
+// Copyright 2024 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -8,6 +8,7 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
@@ -20,32 +21,33 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v6"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes"
 
-	"github.com/pingcap/tidb-operator/pkg/apis/pingcap/v1alpha1"
-	"github.com/pingcap/tidb-operator/tests/e2e/br/utils/portforward"
-	podutil "github.com/pingcap/tidb-operator/tests/third_party/k8s/pod"
+	"github.com/pingcap/tidb-operator/api/v2/br/v1alpha1"
+	"github.com/pingcap/tidb-operator/v2/pkg/client"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/k8s"
+	"github.com/pingcap/tidb-operator/v2/tests/e2e/utils/waiter"
 )
 
 const (
 	minioName  = "minio"
-	minioImage = "minio/minio:RELEASE.2020-05-08T02-40-49Z"
+	minioImage = "gcr.io/pingcap-public/third-party/minio/minio:RELEASE.2024-09-13T20-26-02Z"
 
 	minioBucket = "local" // the bucket for e2e test
 	minioSecret = "minio-secret"
 )
 
 type minioStorage struct {
-	c kubernetes.Interface
+	c client.Client
 	// use portforward to visit service if e2e is not run in cluster
-	fw portforward.PortForwarder
+	fw k8s.PortForwarder
 }
 
-func NewMinio(c kubernetes.Interface, fw portforward.PortForwarder) Interface {
+func NewMinio(c client.Client, fw k8s.PortForwarder) Interface {
 	return &minioStorage{
 		c:  c,
 		fw: fw,
@@ -55,20 +57,20 @@ func NewMinio(c kubernetes.Interface, fw portforward.PortForwarder) Interface {
 func (s *minioStorage) Init(ctx context.Context, ns, accessKey, secretKey string) error {
 	ginkgo.By("init minio s3 storage")
 	pod := getMinioPod(ns)
-	if _, err := s.c.CoreV1().Pods(ns).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
+	if err := s.c.Create(context.TODO(), pod); err != nil {
 		return err
 	}
 	svc := getMinioService(ns)
-	if _, err := s.c.CoreV1().Services(ns).Create(context.TODO(), svc, metav1.CreateOptions{}); err != nil {
+	if err := s.c.Create(context.TODO(), svc); err != nil {
 		return err
 	}
 	secret := getMinioSecret(ns, accessKey, secretKey)
-	if _, err := s.c.CoreV1().Secrets(ns).Create(context.TODO(), secret, metav1.CreateOptions{}); err != nil {
+	if err := s.c.Create(context.TODO(), secret); err != nil {
 		return err
 	}
 	ginkgo.By("wait for minio s3 storage ready")
 
-	if err := podutil.WaitTimeoutForPodReadyInNamespace(s.c, minioName, ns, 5*time.Minute); err != nil {
+	if err := waiter.WaitForPodReadyInNamespace(ctx, s.c, pod, 5*time.Minute); err != nil {
 		return err
 	}
 
@@ -91,7 +93,11 @@ func (s *minioStorage) forwardPort(ctx context.Context, ns string) (string, erro
 	if s.fw == nil {
 		return getDefaultAddr(ns), nil
 	}
-	return portforward.ForwardOnePort(ctx, s.fw, ns, "svc/"+minioName, 9000)
+	host, port, _, err := k8s.ForwardOnePort(s.fw, ns, "svc/"+minioName, 9000)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s:%d", host, port), nil
 }
 
 func getDefaultAddr(ns string) string {
@@ -141,7 +147,8 @@ func (s *minioStorage) IsDataCleaned(ctx context.Context, ns, prefix string) (bo
 }
 
 func (s *minioStorage) accessSecret(ns string) (string, string, error) {
-	secret, err := s.c.CoreV1().Secrets(ns).Get(context.TODO(), minioSecret, metav1.GetOptions{})
+	secret := &corev1.Secret{}
+	err := s.c.Get(context.TODO(), types.NamespacedName{Namespace: ns, Name: minioSecret}, secret)
 	if err != nil {
 		return "", "", err
 	}

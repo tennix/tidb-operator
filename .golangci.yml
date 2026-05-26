@@ -1,34 +1,134 @@
-run:
-  timeout: 20m
-
+version: "2"
+formatters:
+  enable:
+  - goimports
+  settings:
+    goimports:
+      # A list of prefixes, which, if set, checks import paths
+      # with the given prefixes are grouped after 3rd-party packages.
+      # Default: []
+      local-prefixes:
+        - github.com/pingcap/tidb-operator
 linters:
   enable:
-    - typecheck
-    - goimports
-    - gosimple
-    - staticcheck
+    - bodyclose
+    - dogsled
+    - errorlint
+    - copyloopvar
+    - gocheckcompilerdirectives
+    - goconst
+    - gocritic
+    - gocyclo
+    - godox
+    - mnd
+    - goprintffuncname
     - gosec
-  disable:
+    - govet
+    - ineffassign
+    - lll  # TODO(ideascf): recover it
+    - misspell
+    - nakedret
+    - noctx
+    # - nolintlint # TODO(ideascf): recover it
+    - revive
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unparam
+    - unused
+    - whitespace
     - errcheck
+  exclusions:
+    rules:
+      - path: (.+)_test\.go
+        linters:
+          - dupl
+          - mnd
+          - lll
+          - goconst
+    paths:
+      - ".*/br/.*/_test.go"
+      - ".*/br/.*/testutils/.*"
+      - "tests/e2e/.*"
+      - "third_party/.*"
+  settings:
+    gosec:
+      excludes:
+        - G204 # Audit use of command execution
+        - G304 # File path provided as taint input
+    staticcheck:
+      checks:
+        - all
+        - "-SA1019" # TODO: remove this # Using a deprecated function, variable, constant or field
+        - "-ST1003" # Need to rename many variables, like `bucketAcl` to `bucketACL`, `projectId` to `projectID`, etc.
+        - "-ST1000" # Incorrect or missing package comment
+    dupl:
+      threshold: 100
+    funlen:
+      lines: -1
+      statements: 50
+    goconst:
+      min-len: 2
+      min-occurrences: 3
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - dupImport # https://github.com/go-critic/go-critic/issues/845
+        - ifElseChain
+        - octalLiteral
+        - whyNoLint
+    gocyclo:
+      min-complexity: 20
+    godox:
+      keywords:
+        - FIXME
+    mnd:
+      checks:
+        - argument
+        - case
+        - condition
+        - return
+      ignored-numbers:
+        - "0"
+        - "1"
+        - "2"
+        - "3"
+        - "4"
+      ignored-functions:
+        - strings.SplitN
+      ignored-files:
+        - 'tests/e2e/cluster/.+\.go$'
+        - 'tests/e2e/pd/.+\.go$'
+        - 'tests/e2e/tidb/.+\.go$'
+        - 'tests/e2e/tikv/.+\.go$'
+    govet:
+      enable:
+        - nilness
+        # - shadow # TODO(ideascf): recover it
+    errorlint:
+      asserts: false
+    lll:
+      line-length: 140
+    misspell:
+      locale: US
+    nolintlint:
+      allow-unused: false # report any unused nolint directives
+      # TODO(ideascf): recover the following two rules
+      # require-explanation: true # require an explanation for nolint directives
+      # require-specific: true # require nolint directives to be specific about which linter is being skipped
+    revive:
+      rules:
+        - name: unexported-return
+          disabled: true
+        # TODO(ideascf): recover the following three rules
+        # - name: indent-error-flow
+        # - name: unused-parameter
+        # - name: unused-receiver
 
-linters-settings:
-  gosec:
-    excludes:
-      - G107 # Rule: Url provided to HTTP request as taint input
-      - G108 # Rule: Profiling endpoint automatically exposed on /debug/pprof
-      - G306 # Rule: Poor file permissions used when writing to a new file
-      - G402 # Rule: Look for bad TLS connection settings
-      - G404 # Rule: Insecure random number source (rand)
-      - G201 # Rule: SQL query construction using format string
-      - G114 # Rule: Use of net/http serve function that has no support for setting timeouts
-      - G112 # Rule: Potential slowloris attack
-
-issues:
-  exclude-rules:
-    - path: tests
-      linters:
-        - gosec
-    
-    - linters:
-        - staticcheck
-      text: "SA1019:" # Rule: Using a deprecated function, variable, constant or field
+run:
+  timeout: 15m

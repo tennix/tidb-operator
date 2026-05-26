@@ -1,0 +1,21 @@
+apiVersion: core.pingcap.com/v1alpha1
+kind: TiKVGroup
+metadata:
+  name: tikv
+  labels:
+    pingcap.com/group: tikv
+    pingcap.com/component: tikv
+    pingcap.com/cluster: overlay
+spec:
+  cluster:
+    name: overlay
+  version: v8.5.2
+  replicas: 3
+  template:
+    spec:
+      config: ""
+      volumes:
+      - name: data
+        mounts:
+        - type: data
+        storage: 100Gi
